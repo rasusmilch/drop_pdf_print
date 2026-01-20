@@ -1,23 +1,19 @@
-"""Drag-and-drop PDF batch printer (no repeated printer prompts).
+#!/usr/bin/env python3
+"""Drag-and-drop PDF batch printer with a graphical printer chooser.
 
-This is a simplified "drop box" utility: drag one or more PDFs onto the window
-and they will be printed sequentially to a single chosen printer.
+Goal:
+- Drag one or more PDFs onto the window and print them all without repeated dialogs.
+- Choose the printer once (dropdown), optionally remember it, then reuse for the batch.
 
 Printing approach:
-- Windows: Ghostscript + mswinpr2 device (prints directly to the chosen printer).
-- macOS/Linux: tries `lp` (CUPS). If `lp` is unavailable, the script errors.
+- Windows: Ghostscript + mswinpr2 (silent printing to a specific printer).
+- macOS/Linux: uses `lp` (CUPS).
 
-Dependencies (GUI):
-- tkinter (ships with most Python installs on Windows/macOS; Linux may need a package)
-- tkinterdnd2 (pip install tkinterdnd2)
+GUI:
+- tkinter + tkinterdnd2 for drag-and-drop.
 
-Dependency (printing):
-- Ghostscript on Windows (must be installed and on PATH for silent printing)
-
-Notes:
-- The printer is selected once (defaults to the OS default printer) and then reused
-  for all PDFs in the batch.
-- A small JSON config file can remember the last-used printer.
+Notes for Windows:
+- Ghostscript must be installed and on PATH (gswin64c / gswin32c).
 """
 
 from __future__ import annotations
@@ -29,8 +25,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
-
+from typing import Optional, Sequence
 
 CONFIG_FILE_NAME = ".pdf_drop_print_config.json"
 
@@ -142,7 +137,6 @@ def save_printer_name(printer_name: Optional[str]) -> None:
     try:
         config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
     except OSError:
-        # Non-fatal: printing can still proceed.
         return
 
 
@@ -165,6 +159,29 @@ def detect_ghostscript_binary(custom_binary: Optional[str] = None) -> Optional[s
     return None
 
 
+def _load_winspool() -> Optional[object]:
+    """Load the Windows print spooler DLL.
+
+    Some Python distributions cannot resolve 'winspool' by short name; using the
+    explicit 'winspool.drv' avoids that.
+
+    Returns:
+        A ctypes DLL handle, or None if not available.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+
+    try:
+        import ctypes  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return None
+
+    try:
+        return ctypes.WinDLL("winspool.drv")
+    except OSError:
+        return None
+
+
 def get_default_printer_name_windows() -> Optional[str]:
     """Get the Windows default printer name (no extra dependencies).
 
@@ -175,17 +192,20 @@ def get_default_printer_name_windows() -> Optional[str]:
         return None
 
     try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception:  # pylint: disable=broad-except
+        import ctypes  # pylint: disable=import-outside-toplevel
+        from ctypes import wintypes  # pylint: disable=import-outside-toplevel
+    except Exception:
         return None
 
-    get_default_printer = ctypes.windll.winspool.GetDefaultPrinterW
+    winspool = _load_winspool()
+    if winspool is None:
+        return None
+
+    get_default_printer = winspool.GetDefaultPrinterW
     get_default_printer.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
     get_default_printer.restype = wintypes.BOOL
 
     needed_chars = wintypes.DWORD(0)
-    # First call gets required buffer size (in TCHARs).
     get_default_printer(None, ctypes.byref(needed_chars))
     if needed_chars.value == 0:
         return None
@@ -207,18 +227,7 @@ def normalize_printer_name(printer_name: Optional[str]) -> Optional[str]:
 
 
 def collect_pdfs_from_inputs(inputs: Sequence[Path], recursive: bool = False) -> list[Path]:
-    """Collect PDF files from a list of input paths.
-
-    - If a path is a PDF file, it is included.
-    - If a path is a directory, PDFs inside it are included (optionally recursive).
-
-    Args:
-        inputs: Candidate paths (files or directories).
-        recursive: Whether to recurse into subdirectories.
-
-    Returns:
-        Sorted list of unique PDF paths.
-    """
+    """Collect PDF files from a list of input paths."""
     pdf_paths: set[Path] = set()
 
     for item in inputs:
@@ -236,26 +245,126 @@ def collect_pdfs_from_inputs(inputs: Sequence[Path], recursive: bool = False) ->
     return sorted(pdf_paths)
 
 
-def print_pdf_windows_ghostscript(
-    pdf_path: Path,
-    gs_binary: str,
-    printer_name: str,
-    copies: int,
-) -> None:
-    """Print a PDF on Windows using Ghostscript (silent, no dialogs).
+def list_printers_windows() -> list[str]:
+    """List installed printers on Windows using EnumPrintersW (no extra deps).
 
-    Args:
-        pdf_path: Path to PDF.
-        gs_binary: Ghostscript executable.
-        printer_name: Windows printer name.
-        copies: Number of copies.
-
-    Raises:
-        RuntimeError: If Ghostscript invocation fails.
+    Returns:
+        List of printer names (may be empty).
     """
-    # Ghostscript expects "%printer%PRINTER NAME" for mswinpr2 output.
-    output_target = f"%printer%{printer_name}"
+    if not sys.platform.startswith("win"):
+        return []
 
+    try:
+        import ctypes  # pylint: disable=import-outside-toplevel
+        from ctypes import wintypes  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return []
+
+    winspool = _load_winspool()
+    if winspool is None:
+        return []
+
+    # Flags: local printers + connected/network printers.
+    printer_enum_local = 0x00000002
+    printer_enum_connections = 0x00000004
+    flags = printer_enum_local | printer_enum_connections
+
+    class PrinterInfo4(ctypes.Structure):
+        _fields_ = [
+            ("pPrinterName", wintypes.LPWSTR),
+            ("pServerName", wintypes.LPWSTR),
+            ("Attributes", wintypes.DWORD),
+        ]
+
+    enum_printers = winspool.EnumPrintersW
+    enum_printers.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.LPBYTE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    enum_printers.restype = wintypes.BOOL
+
+    needed_bytes = wintypes.DWORD(0)
+    returned_count = wintypes.DWORD(0)
+
+    # First call to get required buffer size.
+    enum_printers(flags, None, 4, None, 0, ctypes.byref(needed_bytes), ctypes.byref(returned_count))
+    if needed_bytes.value == 0 or returned_count.value == 0:
+        return []
+
+    buffer = ctypes.create_string_buffer(needed_bytes.value)
+    ok = enum_printers(
+        flags,
+        None,
+        4,
+        ctypes.cast(buffer, wintypes.LPBYTE),
+        needed_bytes.value,
+        ctypes.byref(needed_bytes),
+        ctypes.byref(returned_count),
+    )
+    if not ok or returned_count.value == 0:
+        return []
+
+    printer_info_ptr = ctypes.cast(buffer, ctypes.POINTER(PrinterInfo4))
+
+    printer_names: list[str] = []
+    for index in range(int(returned_count.value)):
+        name = (printer_info_ptr[index].pPrinterName or "").strip()
+        if name:
+            printer_names.append(name)
+
+    # De-dup, keep stable order.
+    seen: set[str] = set()
+    unique_names: list[str] = []
+    for name in printer_names:
+        if name not in seen:
+            unique_names.append(name)
+            seen.add(name)
+    return unique_names
+
+
+def list_printers_cups() -> list[str]:
+    """List installed printers via CUPS using `lpstat` (macOS/Linux)."""
+    lpstat_binary = shutil.which("lpstat")
+    if lpstat_binary is None:
+        return []
+
+    result = subprocess.run([lpstat_binary, "-p"], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+
+    printer_names: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("printer "):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].strip():
+            printer_names.append(parts[1].strip())
+
+    seen: set[str] = set()
+    unique_names: list[str] = []
+    for name in printer_names:
+        if name not in seen:
+            unique_names.append(name)
+            seen.add(name)
+    return unique_names
+
+
+def list_available_printers() -> list[str]:
+    """List available printers for the current platform."""
+    if sys.platform.startswith("win"):
+        return list_printers_windows()
+    return list_printers_cups()
+
+
+def print_pdf_windows_ghostscript(pdf_path: Path, gs_binary: str, printer_name: str, copies: int) -> None:
+    """Print a PDF on Windows using Ghostscript (silent, no dialogs)."""
+    output_target = f"%printer%{printer_name}"
     command: list[str] = [
         gs_binary,
         "-dBATCH",
@@ -274,21 +383,8 @@ def print_pdf_windows_ghostscript(
         )
 
 
-def print_pdf_cups(
-    pdf_path: Path,
-    printer_name: Optional[str],
-    copies: int,
-) -> None:
-    """Print a PDF via CUPS using `lp` (macOS/Linux).
-
-    Args:
-        pdf_path: Path to PDF.
-        printer_name: Printer name, or None to use system default.
-        copies: Number of copies.
-
-    Raises:
-        RuntimeError: If printing fails or `lp` is not available.
-    """
+def print_pdf_cups(pdf_path: Path, printer_name: Optional[str], copies: int) -> None:
+    """Print a PDF via CUPS using `lp` (macOS/Linux)."""
     lp_binary = shutil.which("lp")
     if lp_binary is None:
         raise RuntimeError("`lp` was not found on PATH (required for macOS/Linux printing).")
@@ -304,18 +400,8 @@ def print_pdf_cups(
         raise RuntimeError(f"`lp` failed printing {pdf_path.name} (rc={result.returncode}).\n{stderr_snippet}")
 
 
-def print_pdfs(
-    pdf_paths: Sequence[Path],
-    settings: PrintSettings,
-    gs_binary_override: Optional[str],
-) -> None:
-    """Print PDFs sequentially using the configured settings.
-
-    Args:
-        pdf_paths: PDF file paths to print.
-        settings: Print settings (printer, copies, remember).
-        gs_binary_override: Optional Ghostscript binary override.
-    """
+def print_pdfs(pdf_paths: Sequence[Path], settings: PrintSettings, gs_binary_override: Optional[str]) -> None:
+    """Print PDFs sequentially using the configured settings."""
     if not pdf_paths:
         raise ValueError("No PDF files provided.")
 
@@ -324,15 +410,13 @@ def print_pdfs(
     if sys.platform.startswith("win"):
         gs_binary = detect_ghostscript_binary(gs_binary_override)
         if gs_binary is None:
-            raise RuntimeError(
-                "Ghostscript was not found on PATH (required for silent Windows PDF printing)."
-            )
+            raise RuntimeError("Ghostscript was not found on PATH (required for silent Windows PDF printing).")
 
         if normalized_printer is None:
             normalized_printer = get_default_printer_name_windows()
 
         if normalized_printer is None:
-            raise RuntimeError("Could not determine a Windows default printer. Specify --printer.")
+            raise RuntimeError("Could not determine a Windows default printer. Specify a printer in the dropdown.")
 
         for pdf_path in pdf_paths:
             print_pdf_windows_ghostscript(
@@ -342,7 +426,6 @@ def print_pdfs(
                 copies=settings.copies,
             )
     else:
-        # macOS/Linux
         for pdf_path in pdf_paths:
             print_pdf_cups(pdf_path=pdf_path, printer_name=normalized_printer, copies=settings.copies)
 
@@ -357,37 +440,61 @@ def run_gui(
     default_remember_printer: bool,
     default_gs_binary: Optional[str],
 ) -> None:
-    """Run drag-and-drop GUI mode.
-
-    Args:
-        default_printer_name: Initial printer name.
-        default_copies: Initial copies value.
-        default_confirm_multiple: Whether to confirm when multiple PDFs are dropped.
-        default_remember_printer: Whether to remember printer selection.
-        default_gs_binary: Optional Ghostscript binary override.
-    """
+    """Run drag-and-drop GUI mode."""
     try:
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-        from tkinterdnd2 import DND_FILES, TkinterDnD
+        import tkinter as tk  # pylint: disable=import-outside-toplevel
+        from tkinter import messagebox, ttk  # pylint: disable=import-outside-toplevel
+        from tkinterdnd2 import DND_FILES, TkinterDnD  # pylint: disable=import-outside-toplevel
     except ImportError as error:
-        raise RuntimeError(
-            "GUI mode requires tkinter and tkinterdnd2. Install with: pip install tkinterdnd2"
-        ) from error
+        raise RuntimeError("GUI mode requires tkinter and tkinterdnd2. Install with: pip install tkinterdnd2") from error
 
     root = TkinterDnD.Tk()
     root.title("PDF Drop Printer")
-    root.geometry("720x420")
+    root.geometry("760x440")
 
     top_frame = ttk.Frame(root, padding=10)
     top_frame.pack(fill="x")
 
-    printer_label = ttk.Label(top_frame, text="Printer (blank = system default):")
+    system_default_label = "<System default>"
+
+    printer_label = ttk.Label(top_frame, text="Printer:")
     printer_label.grid(row=0, column=0, sticky="w")
 
-    printer_name_var = tk.StringVar(value=default_printer_name or "")
-    printer_entry = ttk.Entry(top_frame, textvariable=printer_name_var, width=60)
-    printer_entry.grid(row=0, column=1, sticky="we", padx=(8, 0))
+    printer_display_var = tk.StringVar(value=system_default_label)
+
+    printer_combobox = ttk.Combobox(
+        top_frame,
+        textvariable=printer_display_var,
+        width=60,
+        state="normal",  # allow typing for odd/network printers even if enumeration misses them
+    )
+    printer_combobox.grid(row=0, column=1, sticky="we", padx=(8, 0))
+
+    def refresh_printer_list() -> None:
+        """Refresh the printer dropdown list."""
+        available: list[str] = []
+        try:
+            available = list_available_printers()
+        except Exception:
+            available = []
+
+        values = [system_default_label] + available
+        printer_combobox["values"] = values
+
+        current = (printer_display_var.get() or "").strip()
+        if current and current in values:
+            printer_display_var.set(current)
+            return
+
+        if default_printer_name and default_printer_name in values:
+            printer_display_var.set(default_printer_name)
+        else:
+            printer_display_var.set(system_default_label)
+
+    refresh_button = ttk.Button(top_frame, text="Refresh", command=refresh_printer_list)
+    refresh_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+    refresh_printer_list()
 
     copies_label = ttk.Label(top_frame, text="Copies:")
     copies_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -416,8 +523,7 @@ def run_gui(
 
     instruction_text = (
         "Drag and drop one or more PDF files (or folders containing PDFs) into the box below.\n"
-        "They will be printed sequentially to the selected printer.\n"
-        "\n"
+        "They will be printed sequentially to the selected printer.\n\n"
         "Windows: requires Ghostscript for silent printing.\n"
         "macOS/Linux: uses `lp` (CUPS)."
     )
@@ -431,7 +537,7 @@ def run_gui(
         pady=20,
         justify="center",
         anchor="center",
-        wraplength=680,
+        wraplength=720,
     )
     drop_label.pack(expand=True, fill="both", padx=20, pady=20)
     drop_label.drop_target_register(DND_FILES)
@@ -461,8 +567,11 @@ def run_gui(
             if not confirm:
                 return
 
+        selected = (printer_display_var.get() or "").strip()
+        printer_name = "" if selected == system_default_label else selected
+
         settings = PrintSettings(
-            printer_name=printer_name_var.get(),
+            printer_name=printer_name,
             copies=max(1, int(copies_var.get())),
             remember_printer=bool(remember_var.get()),
         )
@@ -472,7 +581,7 @@ def run_gui(
 
         try:
             print_pdfs(pdf_paths=pdf_paths, settings=settings, gs_binary_override=default_gs_binary)
-        except Exception as error:  # pylint: disable=broad-except
+        except Exception as error:
             status_var.set("Error.")
             messagebox.showerror("Print failed", str(error), parent=root)
             return
@@ -495,9 +604,7 @@ def main() -> None:
     saved_printer_name = load_saved_printer_name()
 
     if args.gui or not args.pdf_files:
-        # GUI mode: start with CLI printer override, else saved printer, else blank (system default).
         initial_printer = args.printer if args.printer is not None else (saved_printer_name or "")
-
         run_gui(
             default_printer_name=initial_printer,
             default_copies=args.copies,
