@@ -24,14 +24,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+import datetime
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
 CONFIG_FILE_NAME = ".pdf_drop_print_config.json"
+SYSTEM_DEFAULT_SENTINEL = "__SYSTEM_DEFAULT__"
 
 
 @dataclass(frozen=True)
@@ -93,7 +97,37 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--remember-printer",
         action="store_true",
-        help="Persist the chosen printer name in a small config file in your home directory.",
+        help="Persist the chosen printer name in a small config file next to the script/executable.",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help=(
+            "Merge (concatenate) all input PDFs into a single PDF before output. "
+            "This can reduce print-job overhead on some network printers."
+        ),
+    )
+    parser.add_argument(
+        "--merge-output",
+        type=Path,
+        default=None,
+        help=(
+            "Output path for the merged PDF. If omitted, a timestamped file is created "
+            "in the first input PDF's folder (GUI) or next to the script/executable (CLI)."
+        ),
+    )
+    parser.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Only write the merged PDF; do not print.",
+    )
+    parser.add_argument(
+        "--keep-merged",
+        action="store_true",
+        help=(
+            "When printing a merged PDF that was auto-generated, keep the merged file "
+            "instead of deleting it afterward."
+        ),
     )
     parser.add_argument(
         "--gui",
@@ -103,63 +137,339 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def get_app_directory() -> Path:
+    """Return the directory of the running script or executable.
+
+    Design goals:
+    - When running as a normal Python script, save config next to the .py file.
+      This avoids surprises caused by the current working directory.
+    - When compiled (e.g., Nuitka), save config next to the final executable.
+
+    Returns:
+        Path to the directory containing the .py file (normal run) or the .exe
+        (compiled run).
+    """
+    # Common convention used by PyInstaller and supported by Nuitka.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
+    # Normal Python run: __file__ points at the script/module location on disk.
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        # Extremely rare (interactive). Fall back to argv[0] / sys.executable.
+        argv0 = sys.argv[0] if sys.argv else ""
+        candidate = Path(argv0) if argv0 else Path(sys.executable)
+        try:
+            return candidate.resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
 def get_config_path() -> Path:
-    """Return the per-user config path."""
-    return Path.home() / CONFIG_FILE_NAME
+    """Return the per-app config path (next to the script/executable).
+
+    Returns:
+        Path to the config file stored alongside the running program.
+    """
+    return get_app_directory() / CONFIG_FILE_NAME
 
 
 def load_saved_printer_name() -> Optional[str]:
     """Load the last saved printer name from the config file.
 
     Returns:
-        The saved printer name, or None if not configured.
+        The saved printer name if configured. Returns an empty string to mean
+        "use system default printer". Returns None if no config exists or the
+        config could not be read.
     """
     config_path = get_config_path()
     if not config_path.is_file():
-        print(f"Unable to find file {config_path}")
         return None
 
     try:
         config_data = json.loads(config_path.read_text(encoding="utf-8"))
-        print(f"Read config from {config_path}")
     except (OSError, json.JSONDecodeError):
-        print(f"Unable to read from {config_path}")
         return None
 
     saved_printer = config_data.get("printer_name")
-    if isinstance(saved_printer, str) and saved_printer.strip():
-        return saved_printer.strip()
+    if not isinstance(saved_printer, str):
+        return None
 
-    return None
+    saved_printer = saved_printer.strip()
+    if not saved_printer:
+        return None
+
+    if saved_printer == SYSTEM_DEFAULT_SENTINEL:
+        return ""
+
+    return saved_printer
 
 
 def save_printer_name(printer_name: Optional[str]) -> None:
     """Save a printer name to the config file.
 
     Args:
-        printer_name: Printer name to persist.
+        printer_name: Printer name to persist. If empty/None, saves a sentinel that
+            represents "system default printer".
+
+    Notes:
+        If the program is located under a protected folder (e.g., Program Files),
+        Windows may block writing the config file. In that case, move the program
+        to a user-writable folder.
     """
     config_path = get_config_path()
-    config_payload = {"printer_name": printer_name or ""}
+
+    normalized = (printer_name or "").strip()
+    stored_value = normalized if normalized else SYSTEM_DEFAULT_SENTINEL
+
+    config_payload = {"printer_name": stored_value}
     try:
         config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
-        print(f"Wrote config to {config_path}")
-    except OSError:
-        print(f"Unable to write to {config_path}")
+    except OSError as error:
+        # Non-fatal: printing can still proceed, but the selection won't persist.
+        print(f"Warning: Failed to write config file: {config_path} ({error})", file=sys.stderr)
         return
 
 
 def detect_ghostscript_binary(custom_binary: Optional[str] = None) -> Optional[str]:
-    """Detect a Ghostscript executable on the system."""
-    if custom_binary:
-        return custom_binary if shutil.which(custom_binary) is not None else None
+    """Detect a Ghostscript executable on the system.
 
+    On Windows, the most common binaries are gswin64c.exe / gswin32c.exe.
+    Some installs do not add Ghostscript to PATH, and some launch contexts
+    (double-click / file association) may not inherit an updated PATH.
+    This function therefore:
+      1) honors an explicit override (custom_binary)
+      2) tries PATH via shutil.which()
+      3) on Windows, searches common install locations under Program Files
+
+    Args:
+        custom_binary: Optional explicit Ghostscript executable name or full path.
+
+    Returns:
+        The detected Ghostscript executable path, or None if not found.
+    """
+    if custom_binary:
+        # Accept either an explicit path or a name found on PATH.
+        custom_path = Path(custom_binary)
+        if custom_path.is_file():
+            return str(custom_path)
+        found = shutil.which(custom_binary)
+        return found
+
+    # First, try PATH.
     for candidate in ("gswin64c", "gswin32c", "gs", "ghostscript"):
-        if shutil.which(candidate) is not None:
-            return candidate
+        found = shutil.which(candidate)
+        if found is not None:
+            return found
+
+    # Windows fallback: scan common installation directories.
+    if sys.platform.startswith("win"):
+        candidate_paths: list[Path] = []
+        for base_dir in (Path("C:/Program Files/gs"), Path("C:/Program Files (x86)/gs")):
+            if not base_dir.is_dir():
+                continue
+            # gs installs look like: C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe
+            candidate_paths.extend(base_dir.glob("gs*/bin/gswin64c.exe"))
+            candidate_paths.extend(base_dir.glob("gs*/bin/gswin32c.exe"))
+
+        if candidate_paths:
+            def sort_key(path_value: Path) -> tuple[int, int, int]:
+                match = re.search(r"gs(\d+)\.(\d+)\.(\d+)", str(path_value))
+                if match:
+                    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                return (0, 0, 0)
+
+            candidate_paths_sorted = sorted(candidate_paths, key=sort_key, reverse=True)
+            for path_value in candidate_paths_sorted:
+                if path_value.name.lower() == "gswin64c.exe":
+                    return str(path_value)
+            return str(candidate_paths_sorted[0])
+
     return None
 
 
+
+
+def _format_timestamp_for_filename(timestamp: Optional[datetime.datetime] = None) -> str:
+    """Format a timestamp suitable for filenames.
+
+    Args:
+        timestamp: Optional timestamp. If omitted, uses the current local time.
+
+    Returns:
+        Timestamp string like '20260121_153045'.
+    """
+    value = timestamp or datetime.datetime.now()
+    return value.strftime("%Y%m%d_%H%M%S")
+
+
+def generate_default_merged_output_path(
+    pdf_paths: Sequence[Path],
+    base_directory: Optional[Path] = None,
+) -> Path:
+    """Generate a default output path for a merged PDF.
+
+    Args:
+        pdf_paths: Input PDF paths, used to pick a reasonable default directory.
+        base_directory: Optional override for where the output should be created.
+
+    Returns:
+        Path for a timestamped merged PDF file.
+    """
+    if base_directory is not None:
+        output_directory = base_directory
+    elif pdf_paths:
+        output_directory = pdf_paths[0].resolve().parent
+    else:
+        output_directory = get_app_directory()
+
+    timestamp = _format_timestamp_for_filename()
+    return (output_directory / f"merged_{timestamp}.pdf").resolve()
+
+
+def _write_ghostscript_response_file(pdf_paths: Sequence[Path]) -> Path:
+    """Write a Ghostscript response file listing input PDFs.
+
+    Ghostscript supports the @filename syntax, which reads additional arguments
+    from a file. This is useful on Windows where command lines can be long.
+
+    Args:
+        pdf_paths: Input PDF paths to include in the response file.
+
+    Returns:
+        Path to a temporary response file. The caller should delete it.
+    """
+    response_file_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".txt",
+        delete=False,
+    )
+    try:
+        for pdf_path in pdf_paths:
+            # Quote paths so spaces are preserved.
+            response_file_handle.write(f"\"{str(pdf_path)}\"\n")
+        response_file_handle.flush()
+        return Path(response_file_handle.name)
+    finally:
+        response_file_handle.close()
+
+
+def merge_pdfs_with_ghostscript(
+    pdf_paths: Sequence[Path],
+    gs_binary: str,
+    output_pdf_path: Path,
+) -> None:
+    """Merge multiple PDFs into a single PDF using Ghostscript.
+
+    Args:
+        pdf_paths: Input PDFs to concatenate, in order.
+        gs_binary: Ghostscript executable path/name.
+        output_pdf_path: Destination PDF path.
+
+    Raises:
+        RuntimeError: If Ghostscript fails.
+    """
+    output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use a response file to avoid Windows command-line length limits.
+    response_file_path = _write_ghostscript_response_file(pdf_paths)
+    try:
+        command = [
+            gs_binary,
+            "-dBATCH",
+            "-dNOPAUSE",
+            "-dSAFER",
+            "-sDEVICE=pdfwrite",
+            "-dAutoRotatePages=/None",
+            f"-sOutputFile={str(output_pdf_path)}",
+            f"@{str(response_file_path)}",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            combined = "\n".join([part for part in [stdout, stderr] if part])
+            raise RuntimeError(f"Ghostscript merge failed (exit {result.returncode}).\n{combined}")
+    finally:
+        try:
+            response_file_path.unlink(missing_ok=True)
+        except OSError:
+            # Best effort cleanup.
+            pass
+
+
+def merge_pdfs_with_pypdf(pdf_paths: Sequence[Path], output_pdf_path: Path) -> None:
+    """Merge multiple PDFs into a single PDF using pypdf.
+
+    This is a pure-Python fallback when Ghostscript is not available.
+
+    Args:
+        pdf_paths: Input PDFs to concatenate, in order.
+        output_pdf_path: Destination PDF path.
+
+    Raises:
+        RuntimeError: If pypdf is not installed.
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter  # pylint: disable=import-outside-toplevel
+    except ImportError as error:  # pragma: no cover
+        raise RuntimeError(
+            "Merging requires Ghostscript or the 'pypdf' package. Install with: pip install pypdf"
+        ) from error
+
+    output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = PdfWriter()
+    for pdf_path in pdf_paths:
+        reader = PdfReader(str(pdf_path))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    with output_pdf_path.open("wb") as output_file:
+        writer.write(output_file)
+
+
+def merge_pdfs(
+    pdf_paths: Sequence[Path],
+    output_pdf_path: Path,
+    gs_binary_override: Optional[str],
+) -> None:
+    """Merge multiple PDFs into a single PDF.
+
+    Prefers Ghostscript when available (fast and reliable), otherwise falls back
+    to pypdf.
+
+    Args:
+        pdf_paths: Input PDFs to concatenate, in order.
+        output_pdf_path: Destination PDF path.
+        gs_binary_override: Optional Ghostscript binary override.
+
+    Raises:
+        RuntimeError: If no supported merger is available.
+    """
+    gs_binary = detect_ghostscript_binary(gs_binary_override)
+    if gs_binary:
+        merge_pdfs_with_ghostscript(pdf_paths=pdf_paths, gs_binary=gs_binary, output_pdf_path=output_pdf_path)
+        return
+
+    merge_pdfs_with_pypdf(pdf_paths=pdf_paths, output_pdf_path=output_pdf_path)
+
+
+def _safe_unlink(file_path: Path) -> None:
+    """Delete a file path best-effort.
+
+    Args:
+        file_path: File path to delete.
+
+    Returns:
+        None.
+    """
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 def _load_winspool() -> Optional[object]:
     """Load the Windows print spooler DLL.
 
@@ -485,14 +795,14 @@ def run_gui(
     """Run drag-and-drop GUI mode."""
     try:
         import tkinter as tk  # pylint: disable=import-outside-toplevel
-        from tkinter import messagebox, ttk  # pylint: disable=import-outside-toplevel
+        from tkinter import filedialog, messagebox, ttk  # pylint: disable=import-outside-toplevel
         from tkinterdnd2 import DND_FILES, TkinterDnD  # pylint: disable=import-outside-toplevel
     except ImportError as error:
         raise RuntimeError("GUI mode requires tkinter and tkinterdnd2. Install with: pip install tkinterdnd2") from error
 
     root = TkinterDnD.Tk()
     root.title("PDF Drop Printer")
-    root.geometry("780x460")
+    root.geometry("780x540")
 
     top_frame = ttk.Frame(root, padding=10)
     top_frame.pack(fill="x")
@@ -502,7 +812,8 @@ def run_gui(
     printer_label = ttk.Label(top_frame, text="Printer:")
     printer_label.grid(row=0, column=0, sticky="w")
 
-    printer_display_var = tk.StringVar(value=system_default_label)
+    initial_selection = default_printer_name.strip() if default_printer_name else ""
+    printer_display_var = tk.StringVar(value=initial_selection if initial_selection else system_default_label)
 
     printer_combobox = ttk.Combobox(
         top_frame,
@@ -513,24 +824,43 @@ def run_gui(
     printer_combobox.grid(row=0, column=1, sticky="we", padx=(8, 0))
 
     def refresh_printer_list() -> None:
-        """Refresh the printer dropdown list."""
+        """Refresh the printer dropdown list.
+
+        Behavior:
+        - If the user typed a printer name not in the enumerated list, keep it.
+        - If the current selection is "<System default>" but we have a saved/default
+          printer name, select that (helps the "remember printer" feature).
+        - Otherwise keep the current selection if it is valid.
+        """
         try:
             available = list_available_printers()
-        except Exception:
+        except Exception:  # pylint: disable=broad-except
             available = []
 
         values = [system_default_label] + available
         printer_combobox["values"] = values
 
         current = (printer_display_var.get() or "").strip()
-        if current and current in values:
+
+        # If the user typed a custom name (not in the dropdown list), keep it.
+        if current and current not in values:
+            return
+
+        preferred = (default_printer_name or "").strip()
+        if (not current) or (current == system_default_label):
+            if preferred and preferred in values:
+                printer_display_var.set(preferred)
+                return
+            printer_display_var.set(system_default_label)
+            return
+
+        # Keep an explicit non-default selection that is valid.
+        if current in values:
             printer_display_var.set(current)
             return
 
-        if default_printer_name and default_printer_name in values:
-            printer_display_var.set(default_printer_name)
-        else:
-            printer_display_var.set(system_default_label)
+        printer_display_var.set(system_default_label)
+
 
     refresh_button = ttk.Button(top_frame, text="Refresh", command=refresh_printer_list)
     refresh_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
@@ -560,11 +890,93 @@ def run_gui(
     )
     remember_checkbox.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
+
+    merge_var = tk.BooleanVar(value=False)
+    merge_checkbox = ttk.Checkbutton(
+        top_frame,
+        variable=merge_var,
+        text="Merge (concatenate) PDFs before output",
+    )
+    merge_checkbox.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+    merge_action_var = tk.StringVar(value="print")
+    merge_print_radio = ttk.Radiobutton(
+        top_frame,
+        text="Print merged PDF",
+        variable=merge_action_var,
+        value="print",
+    )
+    merge_print_radio.grid(row=5, column=1, sticky="w", padx=(28, 0), pady=(2, 0))
+
+    merge_save_radio = ttk.Radiobutton(
+        top_frame,
+        text="Save merged PDF",
+        variable=merge_action_var,
+        value="save",
+    )
+    merge_save_radio.grid(row=6, column=1, sticky="w", padx=(28, 0), pady=(2, 0))
+
+    keep_merged_var = tk.BooleanVar(value=False)
+    keep_merged_checkbox = ttk.Checkbutton(
+        top_frame,
+        variable=keep_merged_var,
+        text="Keep merged PDF after printing (when printing merged)",
+    )
+    keep_merged_checkbox.grid(row=7, column=1, sticky="w", padx=(28, 0), pady=(2, 0))
+
+    merged_output_var = tk.StringVar(value="")
+    merged_output_entry = ttk.Entry(top_frame, textvariable=merged_output_var, width=62)
+    merged_output_entry.grid(row=8, column=1, sticky="we", padx=(28, 0), pady=(6, 0))
+
+    merged_output_browse_button = ttk.Button(top_frame, text="Browse...", command=lambda: None)
+    merged_output_browse_button.grid(row=8, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+
+    def update_merge_ui_state() -> None:
+        """Enable/disable merge-related widgets based on selection."""
+        is_enabled = bool(merge_var.get())
+        action = (merge_action_var.get() or "print").strip().lower()
+
+        radio_state = "normal" if is_enabled else "disabled"
+        merge_print_radio.configure(state=radio_state)
+        merge_save_radio.configure(state=radio_state)
+
+        is_save = is_enabled and action == "save"
+        entry_state = "normal" if is_save else "disabled"
+        merged_output_entry.configure(state=entry_state)
+        merged_output_browse_button.configure(state=entry_state)
+
+        keep_state = "normal" if (is_enabled and action == "print") else "disabled"
+        keep_merged_checkbox.configure(state=keep_state)
+
+    def browse_merged_output() -> None:
+        """Browse for a merged PDF output path."""
+        initial_directory = str(get_app_directory())
+        suggested_name = f"merged_{_format_timestamp_for_filename()}.pdf"
+        chosen_path = filedialog.asksaveasfilename(
+            parent=root,
+            title="Save merged PDF as...",
+            initialdir=initial_directory,
+            initialfile=suggested_name,
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if chosen_path:
+            merged_output_var.set(chosen_path)
+            update_merge_ui_state()
+
+    merged_output_browse_button.configure(command=browse_merged_output)
+
+    # Keep UI state in sync.
+    merge_var.trace_add("write", lambda *_: update_merge_ui_state())
+    merge_action_var.trace_add("write", lambda *_: update_merge_ui_state())
+    update_merge_ui_state()
+
     top_frame.columnconfigure(1, weight=1)
 
     instruction_text = (
         "Drag and drop one or more PDF files (or folders containing PDFs) into the box below.\n"
-        "They will be printed sequentially to the selected printer.\n\n"
+        "Choose a printer once, then drop PDFs to print them.\n\n"
+        "Tip: Enable 'Merge PDFs' to concatenate into one file before printing or saving.\n\n"
         "Windows: requires Ghostscript for silent printing.\n"
         "macOS/Linux: uses `lp` (CUPS)."
     )
@@ -583,7 +995,7 @@ def run_gui(
     drop_label.pack(expand=True, fill="both", padx=20, pady=20)
     drop_label.drop_target_register(DND_FILES)
 
-    status_var = tk.StringVar(value="Ready.")
+    status_var = tk.StringVar(value=f"Ready. Config: {get_config_path()}")
     status_label = ttk.Label(root, textvariable=status_var, padding=(10, 0, 10, 10))
     status_label.pack(fill="x")
 
@@ -608,6 +1020,53 @@ def run_gui(
             if not confirm:
                 return
 
+
+
+        merged_temp_to_delete: Optional[Path] = None
+
+        merge_enabled = bool(merge_var.get())
+        merge_action = (merge_action_var.get() or "print").strip().lower()
+
+        if merge_enabled:
+            if merge_action == "save":
+                output_text = (merged_output_var.get() or "").strip()
+                output_path = Path(output_text) if output_text else generate_default_merged_output_path(pdf_paths=pdf_paths)
+                merged_output_var.set(str(output_path))
+
+                status_var.set(f"Merging {len(pdf_paths)} PDF(s)...")
+                root.update_idletasks()
+
+                try:
+                    merge_pdfs(pdf_paths=pdf_paths, output_pdf_path=output_path, gs_binary_override=default_gs_binary)
+                except Exception as error:  # pylint: disable=broad-except
+                    status_var.set("Error.")
+                    messagebox.showerror("Merge failed", str(error), parent=root)
+                    return
+
+                status_var.set(f"Saved merged PDF: {output_path.name}")
+                messagebox.showinfo("Saved", f"Saved merged PDF to:\n{output_path}", parent=root)
+                return
+
+            keep_merged = bool(keep_merged_var.get())
+            output_text = (merged_output_var.get() or "").strip()
+            if output_text:
+                output_path = Path(output_text)
+            else:
+                output_path = Path(tempfile.gettempdir()) / f"merged_{_format_timestamp_for_filename()}.pdf"
+                if not keep_merged:
+                    merged_temp_to_delete = output_path
+
+            status_var.set(f"Merging {len(pdf_paths)} PDF(s)...")
+            root.update_idletasks()
+
+            try:
+                merge_pdfs(pdf_paths=pdf_paths, output_pdf_path=output_path, gs_binary_override=default_gs_binary)
+            except Exception as error:  # pylint: disable=broad-except
+                status_var.set("Error.")
+                messagebox.showerror("Merge failed", str(error), parent=root)
+                return
+
+            pdf_paths = [output_path]
         selected = (printer_display_var.get() or "").strip()
         printer_name = "" if selected == system_default_label else selected
 
@@ -616,6 +1075,10 @@ def run_gui(
             copies=max(1, int(copies_var.get())),
             remember_printer=bool(remember_var.get()),
         )
+
+        # Persist selection immediately so it is remembered even if printing fails.
+        if settings.remember_printer:
+            save_printer_name(normalize_printer_name(settings.printer_name))
 
         status_var.set(f"Printing {len(pdf_paths)} PDF(s)...")
         root.update_idletasks()
@@ -627,6 +1090,9 @@ def run_gui(
             messagebox.showerror("Print failed", str(error), parent=root)
             return
 
+
+        if merged_temp_to_delete is not None:
+            _safe_unlink(merged_temp_to_delete)
         status_var.set("Done.")
         messagebox.showinfo("Done", f"Printed {len(pdf_paths)} PDF(s).", parent=root)
 
@@ -665,8 +1131,35 @@ def main() -> None:
         remember_printer=args.remember_printer,
     )
 
-    print_pdfs(pdf_paths=pdf_paths, settings=settings, gs_binary_override=args.gs_binary)
-    print(f"Printed {len(pdf_paths)} PDF(s).")
+    pdf_paths_to_print = pdf_paths
+    merged_auto_generated_to_delete: Optional[Path] = None
+
+    if args.merge or args.merge_only:
+        output_path = args.merge_output
+        if output_path is None:
+            output_path = generate_default_merged_output_path(
+                pdf_paths=pdf_paths, base_directory=get_app_directory()
+            )
+
+        merge_pdfs(pdf_paths=pdf_paths, output_pdf_path=output_path, gs_binary_override=args.gs_binary)
+
+        if args.merge_only:
+            print(f"Wrote merged PDF: {output_path}")
+            return
+
+        pdf_paths_to_print = [output_path]
+        if args.merge_output is None and (not args.keep_merged):
+            merged_auto_generated_to_delete = output_path
+
+    print_pdfs(pdf_paths=pdf_paths_to_print, settings=settings, gs_binary_override=args.gs_binary)
+
+    if merged_auto_generated_to_delete is not None:
+        _safe_unlink(merged_auto_generated_to_delete)
+
+    if args.merge or args.merge_only:
+        print(f"Printed merged PDF: {pdf_paths_to_print[0].name}")
+    else:
+        print(f"Printed {len(pdf_paths_to_print)} PDF(s).")
 
 
 if __name__ == "__main__":
