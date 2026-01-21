@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 CONFIG_FILE_NAME = ".pdf_drop_print_config.json"
+SYSTEM_DEFAULT_SENTINEL = "__SYSTEM_DEFAULT__"
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--remember-printer",
         action="store_true",
-        help="Persist the chosen printer name in a small config file in your home directory.",
+        help="Persist the chosen printer name in a small config file next to the script/executable.",
     )
     parser.add_argument(
         "--gui",
@@ -103,60 +105,155 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def get_app_directory() -> Path:
+    """Return the directory of the running script or executable.
+
+    Design goals:
+    - When running as a normal Python script, save config next to the .py file.
+      This avoids surprises caused by the current working directory.
+    - When compiled (e.g., Nuitka), save config next to the final executable.
+
+    Returns:
+        Path to the directory containing the .py file (normal run) or the .exe
+        (compiled run).
+    """
+    # Common convention used by PyInstaller and supported by Nuitka.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
+    # Normal Python run: __file__ points at the script/module location on disk.
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        # Extremely rare (interactive). Fall back to argv[0] / sys.executable.
+        argv0 = sys.argv[0] if sys.argv else ""
+        candidate = Path(argv0) if argv0 else Path(sys.executable)
+        try:
+            return candidate.resolve().parent
+        except Exception:
+            return Path.cwd()
+
+
 def get_config_path() -> Path:
-    """Return the per-user config path."""
-    return Path.home() / CONFIG_FILE_NAME
+    """Return the per-app config path (next to the script/executable).
+
+    Returns:
+        Path to the config file stored alongside the running program.
+    """
+    return get_app_directory() / CONFIG_FILE_NAME
 
 
 def load_saved_printer_name() -> Optional[str]:
     """Load the last saved printer name from the config file.
 
     Returns:
-        The saved printer name, or None if not configured.
+        The saved printer name if configured. Returns an empty string to mean
+        "use system default printer". Returns None if no config exists or the
+        config could not be read.
     """
     config_path = get_config_path()
     if not config_path.is_file():
-        print(f"Unable to find file {config_path}")
         return None
 
     try:
         config_data = json.loads(config_path.read_text(encoding="utf-8"))
-        print(f"Read config from {config_path}")
     except (OSError, json.JSONDecodeError):
-        print(f"Unable to read from {config_path}")
         return None
 
     saved_printer = config_data.get("printer_name")
-    if isinstance(saved_printer, str) and saved_printer.strip():
-        return saved_printer.strip()
+    if not isinstance(saved_printer, str):
+        return None
 
-    return None
+    saved_printer = saved_printer.strip()
+    if not saved_printer:
+        return None
+
+    if saved_printer == SYSTEM_DEFAULT_SENTINEL:
+        return ""
+
+    return saved_printer
 
 
 def save_printer_name(printer_name: Optional[str]) -> None:
     """Save a printer name to the config file.
 
     Args:
-        printer_name: Printer name to persist.
+        printer_name: Printer name to persist. If empty/None, saves a sentinel that
+            represents "system default printer".
+
+    Notes:
+        If the program is located under a protected folder (e.g., Program Files),
+        Windows may block writing the config file. In that case, move the program
+        to a user-writable folder.
     """
     config_path = get_config_path()
-    config_payload = {"printer_name": printer_name or ""}
+
+    normalized = (printer_name or "").strip()
+    stored_value = normalized if normalized else SYSTEM_DEFAULT_SENTINEL
+
+    config_payload = {"printer_name": stored_value}
     try:
         config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
-        print(f"Wrote config to {config_path}")
-    except OSError:
-        print(f"Unable to write to {config_path}")
+    except OSError as error:
+        # Non-fatal: printing can still proceed, but the selection won't persist.
+        print(f"Warning: Failed to write config file: {config_path} ({error})", file=sys.stderr)
         return
 
 
 def detect_ghostscript_binary(custom_binary: Optional[str] = None) -> Optional[str]:
-    """Detect a Ghostscript executable on the system."""
-    if custom_binary:
-        return custom_binary if shutil.which(custom_binary) is not None else None
+    """Detect a Ghostscript executable on the system.
 
+    On Windows, the most common binaries are gswin64c.exe / gswin32c.exe.
+    Some installs do not add Ghostscript to PATH, and some launch contexts
+    (double-click / file association) may not inherit an updated PATH.
+    This function therefore:
+      1) honors an explicit override (custom_binary)
+      2) tries PATH via shutil.which()
+      3) on Windows, searches common install locations under Program Files
+
+    Args:
+        custom_binary: Optional explicit Ghostscript executable name or full path.
+
+    Returns:
+        The detected Ghostscript executable path, or None if not found.
+    """
+    if custom_binary:
+        # Accept either an explicit path or a name found on PATH.
+        custom_path = Path(custom_binary)
+        if custom_path.is_file():
+            return str(custom_path)
+        found = shutil.which(custom_binary)
+        return found
+
+    # First, try PATH.
     for candidate in ("gswin64c", "gswin32c", "gs", "ghostscript"):
-        if shutil.which(candidate) is not None:
-            return candidate
+        found = shutil.which(candidate)
+        if found is not None:
+            return found
+
+    # Windows fallback: scan common installation directories.
+    if sys.platform.startswith("win"):
+        candidate_paths: list[Path] = []
+        for base_dir in (Path("C:/Program Files/gs"), Path("C:/Program Files (x86)/gs")):
+            if not base_dir.is_dir():
+                continue
+            # gs installs look like: C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe
+            candidate_paths.extend(base_dir.glob("gs*/bin/gswin64c.exe"))
+            candidate_paths.extend(base_dir.glob("gs*/bin/gswin32c.exe"))
+
+        if candidate_paths:
+            def sort_key(path_value: Path) -> tuple[int, int, int]:
+                match = re.search(r"gs(\d+)\.(\d+)\.(\d+)", str(path_value))
+                if match:
+                    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                return (0, 0, 0)
+
+            candidate_paths_sorted = sorted(candidate_paths, key=sort_key, reverse=True)
+            for path_value in candidate_paths_sorted:
+                if path_value.name.lower() == "gswin64c.exe":
+                    return str(path_value)
+            return str(candidate_paths_sorted[0])
+
     return None
 
 
@@ -502,7 +599,8 @@ def run_gui(
     printer_label = ttk.Label(top_frame, text="Printer:")
     printer_label.grid(row=0, column=0, sticky="w")
 
-    printer_display_var = tk.StringVar(value=system_default_label)
+    initial_selection = default_printer_name.strip() if default_printer_name else ""
+    printer_display_var = tk.StringVar(value=initial_selection if initial_selection else system_default_label)
 
     printer_combobox = ttk.Combobox(
         top_frame,
@@ -513,24 +611,43 @@ def run_gui(
     printer_combobox.grid(row=0, column=1, sticky="we", padx=(8, 0))
 
     def refresh_printer_list() -> None:
-        """Refresh the printer dropdown list."""
+        """Refresh the printer dropdown list.
+
+        Behavior:
+        - If the user typed a printer name not in the enumerated list, keep it.
+        - If the current selection is "<System default>" but we have a saved/default
+          printer name, select that (helps the "remember printer" feature).
+        - Otherwise keep the current selection if it is valid.
+        """
         try:
             available = list_available_printers()
-        except Exception:
+        except Exception:  # pylint: disable=broad-except
             available = []
 
         values = [system_default_label] + available
         printer_combobox["values"] = values
 
         current = (printer_display_var.get() or "").strip()
-        if current and current in values:
+
+        # If the user typed a custom name (not in the dropdown list), keep it.
+        if current and current not in values:
+            return
+
+        preferred = (default_printer_name or "").strip()
+        if (not current) or (current == system_default_label):
+            if preferred and preferred in values:
+                printer_display_var.set(preferred)
+                return
+            printer_display_var.set(system_default_label)
+            return
+
+        # Keep an explicit non-default selection that is valid.
+        if current in values:
             printer_display_var.set(current)
             return
 
-        if default_printer_name and default_printer_name in values:
-            printer_display_var.set(default_printer_name)
-        else:
-            printer_display_var.set(system_default_label)
+        printer_display_var.set(system_default_label)
+
 
     refresh_button = ttk.Button(top_frame, text="Refresh", command=refresh_printer_list)
     refresh_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
@@ -583,7 +700,7 @@ def run_gui(
     drop_label.pack(expand=True, fill="both", padx=20, pady=20)
     drop_label.drop_target_register(DND_FILES)
 
-    status_var = tk.StringVar(value="Ready.")
+    status_var = tk.StringVar(value=f"Ready. Config: {get_config_path()}")
     status_label = ttk.Label(root, textvariable=status_var, padding=(10, 0, 10, 10))
     status_label.pack(fill="x")
 
@@ -616,6 +733,10 @@ def run_gui(
             copies=max(1, int(copies_var.get())),
             remember_printer=bool(remember_var.get()),
         )
+
+        # Persist selection immediately so it is remembered even if printing fails.
+        if settings.remember_printer:
+            save_printer_name(normalize_printer_name(settings.printer_name))
 
         status_var.set(f"Printing {len(pdf_paths)} PDF(s)...")
         root.update_idletasks()
